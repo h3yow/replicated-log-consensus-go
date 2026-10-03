@@ -1,6 +1,7 @@
 package raft
 
 // compact 将 upto（含）之前的日志压缩为快照前缀并持久化。
+// 快照记录压缩点处的成员配置，随 InstallSnapshot 传播给落后节点。
 func (n *Node) compact(upto Index, data []byte) {
 	if upto > n.commitIndex {
 		upto = n.commitIndex // 只允许压缩已提交的前缀
@@ -8,11 +9,11 @@ func (n *Node) compact(upto Index, data []byte) {
 	if upto <= n.log.snapshotLastIndex {
 		return
 	}
-	n.log.compactTo(upto, append([]byte(nil), data...))
+	n.log.compactTo(upto, append([]byte(nil), data...), n.appliedConfig())
 	n.persist()
 }
 
-// sendSnapshot 向落后节点发送快照。
+// sendSnapshot 向落后节点发送快照（含快照点处的成员配置）。
 func (n *Node) sendSnapshot(to NodeID) {
 	n.outbox = append(n.outbox, Message{
 		Type:              MsgInstallSnapshot,
@@ -22,6 +23,8 @@ func (n *Node) sendSnapshot(to NodeID) {
 		SnapshotLastIndex: n.log.snapshotLastIndex,
 		SnapshotLastTerm:  n.log.snapshotLastTerm,
 		SnapshotData:      append([]byte(nil), n.log.snapshotData...),
+		SnapshotVoters:    append([]NodeID(nil), n.log.snapVoters...),
+		SnapshotLearners:  append([]NodeID(nil), n.log.snapLearners...),
 	})
 }
 
@@ -44,8 +47,27 @@ func (n *Node) handleInstallSnapshot(m Message) {
 		return
 	}
 
-	kept := n.log.installSnapshot(m.SnapshotLastIndex, m.SnapshotLastTerm, m.SnapshotData)
+	snapConf := ConfigState{Voters: m.SnapshotVoters, Learners: m.SnapshotLearners}
+	kept := n.log.installSnapshot(m.SnapshotLastIndex, m.SnapshotLastTerm, m.SnapshotData, snapConf)
 	_ = kept
+	// 快照携带配置时，接收方采用快照点处的配置（旧格式快照不含配置则保持现状）。
+	if !snapConf.Empty() {
+		n.voters = make(map[NodeID]bool, len(snapConf.Voters))
+		for _, v := range snapConf.Voters {
+			n.voters[v] = true
+		}
+		n.learners = make(map[NodeID]bool, len(snapConf.Learners))
+		for _, l := range snapConf.Learners {
+			n.learners[l] = true
+		}
+		if !snapConf.Contains(n.id) {
+			// 快照显示本节点已被移出集群：停机。
+			if n.role != Follower {
+				n.becomeFollower(n.term, StepDownNone)
+			}
+			n.removed = true
+		}
+	}
 	// 提交点/应用点至少推进到快照末点；快照内容作为一条应用消息交给状态机。
 	if n.commitIndex < m.SnapshotLastIndex {
 		n.commitIndex = m.SnapshotLastIndex

@@ -64,4 +64,7 @@ type Message struct {
 	SnapshotLastIndex Index
 	SnapshotLastTerm  Term
 	SnapshotData      []byte
+	// 快照点处的成员配置（空表示快照不含配置——兼容旧格式，接收方保持现状）。
+	SnapshotVoters   []NodeID
+	SnapshotLearners []NodeID
 }

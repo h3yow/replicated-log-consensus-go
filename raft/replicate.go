@@ -30,12 +30,10 @@ func (n *Node) sendAppend(to NodeID) {
 	})
 }
 
-// broadcastAppend 向所有对等节点发送复制消息。
+// broadcastAppend 向所有复制对象（投票成员 + 学习者）发送复制消息。
 func (n *Node) broadcastAppend() {
-	for _, p := range n.cfg.Peers {
-		if p != n.id {
-			n.sendAppend(p)
-		}
+	for _, p := range n.replicationTargets() {
+		n.sendAppend(p)
 	}
 }
 
@@ -126,6 +124,7 @@ func (n *Node) handleAppendEntriesResp(m Message) {
 			n.nextIndex[m.From] = m.MatchIndex + 1
 		}
 		n.maybeCommit()
+		n.maybePromoteLearners() // 学习者追平后自动提升为投票成员
 		return
 	}
 	// 失败：按冲突提示回退 nextIndex 并重试。
@@ -157,6 +156,7 @@ func (n *Node) handleAppendEntriesResp(m Message) {
 }
 
 // maybeCommit 只提交"被多数派复制且不早于当前任期"的条目（Raft §5.4.2）。
+// 多数派按当前已应用的投票成员配置计数；学习者不计入。
 func (n *Node) maybeCommit() {
 	for idx := n.log.lastIndex(); idx > n.commitIndex; idx-- {
 		t, _ := n.log.termAt(idx)
@@ -164,12 +164,12 @@ func (n *Node) maybeCommit() {
 			break // 更早任期的条目只能随本任期条目间接收尾
 		}
 		count := 0
-		for _, p := range n.cfg.Peers {
-			if n.matchIndex[p] >= idx {
+		for v := range n.voters {
+			if n.matchIndex[v] >= idx {
 				count++
 			}
 		}
-		if count >= n.cfg.quorum() {
+		if count >= n.quorum() {
 			n.commitIndex = idx
 			n.persist()
 			n.maybeApply()
@@ -179,12 +179,22 @@ func (n *Node) maybeCommit() {
 }
 
 // maybeApply 将已提交未应用的条目送入应用队列（保证按序、不重复）。
+// 配置条目在应用时生效（apply-on-commit）。
 func (n *Node) maybeApply() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		e, ok := n.log.entryAt(n.lastApplied)
 		if !ok {
 			continue // 快照点等位置无实体条目
+		}
+		if e.Kind == EntryConfig {
+			n.applyConfigEntry(e)
+			conf := e.Config.Clone()
+			n.applyCh = append(n.applyCh, ApplyMsg{
+				Index:  n.lastApplied,
+				Config: &conf,
+			})
+			continue
 		}
 		n.applyCh = append(n.applyCh, ApplyMsg{
 			Index:   n.lastApplied,

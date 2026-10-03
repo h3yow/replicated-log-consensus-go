@@ -97,16 +97,34 @@ func TestVoteRejectReasons(t *testing.T) {
 	sim.Node(leader).Propose([]byte("cmd-1"))
 	sim.Run(20)
 
-	// 场景1：过期任期的投票请求 → RejectStaleTerm。
+	// 选出两个跟随者：f 用于场景1/2，请求方必须是配置内成员。
 	follower := NodeID(0)
+	other := NodeID(0)
 	for _, id := range []NodeID{1, 2, 3} {
-		if id != leader {
+		if id == leader {
+			continue
+		}
+		if follower == 0 {
 			follower = id
-			break
+		} else {
+			other = id
 		}
 	}
 	f := sim.Node(follower)
-	f.Step(Message{Type: MsgRequestVote, From: 99, To: follower, Term: f.Term() - 1})
+
+	// 场景0：配置外节点的拉票 → RejectNotInConfig，且不抬升本地任期。
+	termBefore := f.Term()
+	f.Step(Message{Type: MsgRequestVote, From: 99, To: follower, Term: f.Term() + 5})
+	if f.LastVoteDecision() != RejectNotInConfig {
+		t.Fatalf("期望 RejectNotInConfig，得到 %s", f.LastVoteDecision())
+	}
+	if f.Term() != termBefore {
+		t.Fatalf("配置外拉票抬升了任期: %d -> %d", termBefore, f.Term())
+	}
+	t.Logf("node=%d 拒绝配置外拉票: reason=%s 任期保持=%d", follower, f.LastVoteDecision(), f.Term())
+
+	// 场景1：过期任期的投票请求 → RejectStaleTerm。
+	f.Step(Message{Type: MsgRequestVote, From: other, To: follower, Term: f.Term() - 1})
 	if f.LastVoteDecision() != RejectStaleTerm {
 		t.Fatalf("期望 RejectStaleTerm，得到 %s", f.LastVoteDecision())
 	}
@@ -116,12 +134,12 @@ func TestVoteRejectReasons(t *testing.T) {
 	// 用与本地日志完全一致的信息请求更高任期，应先被批准。
 	lastIdx := f.LastLogIndex()
 	lastEntry, _ := f.EntryAt(lastIdx)
-	f.Step(Message{Type: MsgRequestVote, From: 98, To: follower, Term: f.Term() + 1,
+	f.Step(Message{Type: MsgRequestVote, From: other, To: follower, Term: f.Term() + 1,
 		LastLogIndex: lastIdx, LastLogTerm: lastEntry.Term})
 	if f.LastVoteDecision() != VoteGranted {
 		t.Fatalf("期望 VoteGranted，得到 %s", f.LastVoteDecision())
 	}
-	f.Step(Message{Type: MsgRequestVote, From: 97, To: follower, Term: f.Term(),
+	f.Step(Message{Type: MsgRequestVote, From: leader, To: follower, Term: f.Term(),
 		LastLogIndex: lastIdx, LastLogTerm: lastEntry.Term})
 	if f.LastVoteDecision() != RejectAlreadyVoted {
 		t.Fatalf("期望 RejectAlreadyVoted，得到 %s", f.LastVoteDecision())
@@ -130,7 +148,7 @@ func TestVoteRejectReasons(t *testing.T) {
 
 	// 场景3：候选人日志落后 → RejectLogNotUpToDate。
 	f2 := sim.Node(leader) // 领导者日志最新
-	f2.Step(Message{Type: MsgRequestVote, From: 96, To: leader, Term: f2.Term() + 1,
+	f2.Step(Message{Type: MsgRequestVote, From: other, To: leader, Term: f2.Term() + 1,
 		LastLogIndex: 0, LastLogTerm: 0})
 	if f2.LastVoteDecision() != RejectLogNotUpToDate {
 		t.Fatalf("期望 RejectLogNotUpToDate，得到 %s", f2.LastVoteDecision())

@@ -14,6 +14,7 @@ import (
 type Sim struct {
 	nodes   map[NodeID]*Node
 	storage map[NodeID]*MemoryStorage
+	boot    map[NodeID][]NodeID // 各节点的引导配置（重启时保持一致的引导语义）
 	cfg     Config
 	rnd     *rand.Rand
 	seed    int64
@@ -50,24 +51,46 @@ func NewSim(n int, cfg Config, seed int64) *Sim {
 	s := &Sim{
 		nodes:     make(map[NodeID]*Node),
 		storage:   make(map[NodeID]*MemoryStorage),
+		boot:      make(map[NodeID][]NodeID),
 		cfg:       cfg,
 		rnd:       rand.New(rand.NewSource(seed)),
 		seed:      seed,
 		partition: make(map[NodeID]bool),
 	}
 	for _, id := range peers {
-		c := cfg
-		c.ID = id
-		st := NewMemoryStorage()
-		node, err := NewNode(c, st, rand.New(rand.NewSource(seed+int64(id)*7919)))
-		if err != nil {
-			panic(err)
-		}
-		s.nodes[id] = node
-		s.storage[id] = st
+		s.boot[id] = peers
+		s.spawn(id)
 	}
 	s.logf("sim init: nodes=%v seed=%d", peers, seed)
 	return s
+}
+
+// spawn 按引导配置创建（或重建）一个节点。
+func (s *Sim) spawn(id NodeID) {
+	c := s.cfg
+	c.ID = id
+	c.Peers = s.boot[id]
+	st := s.storage[id]
+	if st == nil {
+		st = NewMemoryStorage()
+		s.storage[id] = st
+	}
+	node, err := NewNode(c, st, rand.New(rand.NewSource(s.seed+int64(id)*7919+int64(s.tick))))
+	if err != nil {
+		panic(err)
+	}
+	s.nodes[id] = node
+}
+
+// AddNode 把一个全新的空节点以学习者身份接入仿真（尚不在集群配置内）。
+// 之后由领导者通过 ProposeAddLearner 把它纳入配置并复制追赶。
+func (s *Sim) AddNode(id NodeID) {
+	if _, ok := s.nodes[id]; ok {
+		panic(fmt.Sprintf("node %d already exists", id))
+	}
+	s.boot[id] = nil // 空配置引导：全新学习者，等待领导者推送配置
+	s.spawn(id)
+	s.logf("MEMBERSHIP add-node: node %d started as pristine learner", id)
 }
 
 func (s *Sim) logf(format string, args ...interface{}) {
@@ -107,14 +130,9 @@ func (s *Sim) Crash(id NodeID) {
 
 // Restart 从持久化存储重启节点。
 func (s *Sim) Restart(id NodeID) {
-	c := s.cfg
-	c.ID = id
-	node, err := NewNode(c, s.storage[id], rand.New(rand.NewSource(s.seed+int64(id)*7919+int64(s.tick))))
-	if err != nil {
-		panic(err)
-	}
-	s.nodes[id] = node
-	s.logf("FAULT restart: node %d term=%d commit=%d", id, node.Term(), node.CommitIndex())
+	s.spawn(id)
+	n := s.nodes[id]
+	s.logf("FAULT restart: node %d term=%d commit=%d conf=%v", id, n.Term(), n.CommitIndex(), n.AppliedConfig())
 }
 
 // disconnected 判定一条消息是否被分区阻断。
@@ -222,8 +240,10 @@ func (s *Sim) DumpState() string {
 	var b strings.Builder
 	for _, id := range s.sortedIDs() {
 		n := s.nodes[id]
-		fmt.Fprintf(&b, "node=%d role=%s term=%d commit=%d log=%s\n",
-			id, n.Role(), n.Term(), n.CommitIndex(), n.LogString())
+		conf := n.AppliedConfig()
+		fmt.Fprintf(&b, "node=%d role=%s term=%d commit=%d removed=%v learner=%v voters=%v learners=%v log=%s\n",
+			id, n.Role(), n.Term(), n.CommitIndex(), n.Removed(), n.IsLearner(),
+			conf.Voters, conf.Learners, n.LogString())
 	}
 	return b.String()
 }

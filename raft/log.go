@@ -7,7 +7,10 @@ type raftLog struct {
 	snapshotLastIndex Index
 	snapshotLastTerm  Term
 	snapshotData      []byte
-	entries           []Entry
+	// 快照点处的成员配置（随 InstallSnapshot 传播）。
+	snapVoters   []NodeID
+	snapLearners []NodeID
+	entries      []Entry
 }
 
 func newLog() *raftLog { return &raftLog{} }
@@ -68,8 +71,8 @@ func (l *raftLog) append(entries ...Entry) {
 }
 
 // compactTo 将 upto（含）之前的日志压缩为快照前缀。
-// upto 必须 <= lastIndex。data 为快照内容。
-func (l *raftLog) compactTo(upto Index, data []byte) {
+// upto 必须 <= lastIndex。data 为快照内容，conf 为快照点处的成员配置。
+func (l *raftLog) compactTo(upto Index, data []byte, conf ConfigState) {
 	if upto <= l.snapshotLastIndex {
 		return
 	}
@@ -81,12 +84,15 @@ func (l *raftLog) compactTo(upto Index, data []byte) {
 	l.snapshotLastIndex = upto
 	l.snapshotLastTerm = term
 	l.snapshotData = data
+	l.snapVoters = append([]NodeID(nil), conf.Voters...)
+	l.snapLearners = append([]NodeID(nil), conf.Learners...)
 }
 
 // installSnapshot 用快照替换前缀；若本地存在与快照末点匹配的条目，
 // 则保留其后的更长后缀，否则丢弃全部本地条目。
+// conf 为快照携带的成员配置（为空表示快照不含配置，保持现状——兼容旧格式）。
 // 返回是否保留了后缀。
-func (l *raftLog) installSnapshot(lastIndex Index, lastTerm Term, data []byte) bool {
+func (l *raftLog) installSnapshot(lastIndex Index, lastTerm Term, data []byte, conf ConfigState) bool {
 	keepSuffix := false
 	if t, ok := l.termAt(lastIndex); ok && t == lastTerm && lastIndex > l.snapshotLastIndex {
 		keepSuffix = true
@@ -97,5 +103,7 @@ func (l *raftLog) installSnapshot(lastIndex Index, lastTerm Term, data []byte) b
 	l.snapshotLastIndex = lastIndex
 	l.snapshotLastTerm = lastTerm
 	l.snapshotData = data
+	l.snapVoters = append([]NodeID(nil), conf.Voters...)
+	l.snapLearners = append([]NodeID(nil), conf.Learners...)
 	return keepSuffix
 }

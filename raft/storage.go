@@ -12,6 +12,12 @@ type PersistentState struct {
 	SnapIndex   Index
 	SnapTerm    Term
 	SnapData    []byte
+	// 当前已应用的成员配置（提交点处生效的配置）。
+	Voters   []NodeID
+	Learners []NodeID
+	// 快照点处的成员配置（随快照一起传播给落后节点/新节点）。
+	SnapVoters   []NodeID
+	SnapLearners []NodeID
 }
 
 // Storage 抽象持久化存储。MemoryStorage 支持"崩溃-重启"语义：
@@ -47,7 +53,16 @@ func (m *MemoryStorage) Load() (PersistentState, error) {
 
 func cloneState(s PersistentState) PersistentState {
 	out := s
-	out.Log = append([]Entry(nil), s.Log...)
+	out.Log = make([]Entry, len(s.Log))
+	for i, e := range s.Log {
+		e.Config = e.Config.Clone()
+		e.Command = append([]byte(nil), e.Command...)
+		out.Log[i] = e
+	}
 	out.SnapData = append([]byte(nil), s.SnapData...)
+	out.Voters = append([]NodeID(nil), s.Voters...)
+	out.Learners = append([]NodeID(nil), s.Learners...)
+	out.SnapVoters = append([]NodeID(nil), s.SnapVoters...)
+	out.SnapLearners = append([]NodeID(nil), s.SnapLearners...)
 	return out
 }

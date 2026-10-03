@@ -16,8 +16,11 @@ func (n *Node) becomeFollower(term Term, reason StepDownReason) {
 	n.resetElectionTimeout()
 }
 
-// startElection 发起新一轮选举。
+// startElection 发起新一轮选举。仅投票成员可参选。
 func (n *Node) startElection() {
+	if !n.isVoter(n.id) {
+		return
+	}
 	n.role = Candidate
 	n.term++
 	n.votedFor = n.id
@@ -26,11 +29,11 @@ func (n *Node) startElection() {
 	n.votesReceived = map[NodeID]bool{n.id: true}
 	n.resetElectionTimeout()
 	// 单节点集群立即当选。
-	if n.cfg.quorum() == 1 {
+	if n.quorum() == 1 {
 		n.becomeLeader()
 		return
 	}
-	for _, p := range n.cfg.Peers {
+	for _, p := range n.appliedConfig().Voters {
 		if p == n.id {
 			continue
 		}
@@ -50,13 +53,14 @@ func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.nextIndex = make(map[NodeID]Index)
 	n.matchIndex = make(map[NodeID]Index)
-	for _, p := range n.cfg.Peers {
+	// 复制对象 = 投票成员 + 学习者（学习者也要追赶）。
+	for _, p := range n.replicationTargets() {
 		n.nextIndex[p] = n.log.lastIndex() + 1
 		n.matchIndex[p] = 0
 	}
 	n.matchIndex[n.id] = n.log.lastIndex()
 	// 追加一条本任期的空条目，使"只提交当前任期条目"的规则能尽快推进提交点。
-	n.log.append(Entry{Term: n.term, Command: nil})
+	n.log.append(Entry{Term: n.term, Kind: EntryNormal, Command: nil})
 	n.persist()
 	n.matchIndex[n.id] = n.log.lastIndex()
 	n.broadcastAppend()
@@ -72,10 +76,13 @@ func (n *Node) isUpToDate(idx Index, term Term) bool {
 }
 
 // handleRequestVote 处理投票请求，给出可区分的拒绝原因。
+// 候选人成员资格已在 Step 中前置检查；此处再排除本节点不是投票成员的情况。
 func (n *Node) handleRequestVote(m Message) {
 	grant := false
 	reason := VoteGranted
 	switch {
+	case !n.isVoter(n.id):
+		reason = RejectNotInConfig // 学习者/非成员不投票
 	case m.Term < n.term:
 		reason = RejectStaleTerm
 	case n.hasVoted && n.votedFor != m.From:
@@ -108,9 +115,12 @@ func (n *Node) handleRequestVoteResp(m Message) {
 	if n.role != Candidate || m.Term != n.term {
 		return
 	}
+	if !n.isVoter(m.From) {
+		return // 只统计当前投票成员的票
+	}
 	if m.VoteGranted {
 		n.votesReceived[m.From] = true
-		if len(n.votesReceived) >= n.cfg.quorum() {
+		if len(n.votesReceived) >= n.quorum() {
 			n.becomeLeader()
 		}
 	}
