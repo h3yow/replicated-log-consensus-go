@@ -609,3 +609,49 @@ func runMembershipFaultInjection(t *testing.T, seed int64, ticks int) {
 	}
 	t.Logf("最终状态:\n%s", sim.DumpState())
 }
+
+// TestMembershipDeterministicReplay 验证：含扩缩容的运行在相同种子下可逐字节重放。
+func TestMembershipDeterministicReplay(t *testing.T) {
+	run := func() []string {
+		sim := NewSim(3, testConfig(), 555)
+		sim.SetLoss(0.15)
+		sim.SetDup(0.15)
+		sim.SetReorder(true)
+		sim.AddNode(4)
+		for i := 0; i < 150; i++ {
+			switch i {
+			case 20:
+				if leader, ok := sim.Leader(); ok {
+					sim.Node(leader).ProposeAddLearner(4)
+				}
+			case 45:
+				sim.Partition(2)
+			case 70:
+				sim.Heal()
+				if leader, ok := sim.Leader(); ok {
+					sim.Node(leader).ProposeRemove(3)
+				}
+			case 100:
+				sim.Crash(1)
+				sim.Restart(1)
+			}
+			if i%7 == 0 {
+				if leader, ok := sim.Leader(); ok {
+					sim.Node(leader).Propose([]byte(fmt.Sprintf("replay-%d", i)))
+				}
+			}
+			sim.Tick()
+		}
+		return append(sim.Events(), sim.DumpState())
+	}
+	a, b := run(), run()
+	if len(a) != len(b) {
+		t.Fatalf("重放长度不一致: %d vs %d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("重放分歧 @%d:\nA: %s\nB: %s", i, a[i], b[i])
+		}
+	}
+	t.Logf("含扩缩容的运行两次重放完全一致（%d 条事件）", len(a))
+}
