@@ -50,8 +50,11 @@ func (n *Node) handleInstallSnapshot(m Message) {
 	snapConf := ConfigState{Voters: m.SnapshotVoters, Learners: m.SnapshotLearners}
 	kept := n.log.installSnapshot(m.SnapshotLastIndex, m.SnapshotLastTerm, m.SnapshotData, snapConf)
 	_ = kept
-	// 快照携带配置时，接收方采用快照点处的配置（旧格式快照不含配置则保持现状）。
-	if !snapConf.Empty() {
+	// 采用快照携带的配置，但仅当快照不落后于本地已应用点
+	// （否则本地配置更新，不能回退）。旧格式快照不含配置则保持现状。
+	// 注意：此处不做"被移除"判定——快照接收方可能尚在配置之外追赶
+	// （全新学习者），移除判定只发生在应用已提交配置条目时。
+	if !snapConf.Empty() && m.SnapshotLastIndex >= n.lastApplied {
 		n.voters = make(map[NodeID]bool, len(snapConf.Voters))
 		for _, v := range snapConf.Voters {
 			n.voters[v] = true
@@ -59,13 +62,6 @@ func (n *Node) handleInstallSnapshot(m Message) {
 		n.learners = make(map[NodeID]bool, len(snapConf.Learners))
 		for _, l := range snapConf.Learners {
 			n.learners[l] = true
-		}
-		if !snapConf.Contains(n.id) {
-			// 快照显示本节点已被移出集群：停机。
-			if n.role != Follower {
-				n.becomeFollower(n.term, StepDownNone)
-			}
-			n.removed = true
 		}
 	}
 	// 提交点/应用点至少推进到快照末点；快照内容作为一条应用消息交给状态机。
@@ -89,6 +85,9 @@ func (n *Node) handleInstallSnapshot(m Message) {
 func (n *Node) handleInstallSnapshotResp(m Message) {
 	if n.role != Leader || m.Term != n.term {
 		return
+	}
+	if !n.isVoter(m.From) && !n.isLearner(m.From) {
+		return // 已移出配置的节点：忽略
 	}
 	if m.MatchIndex > n.matchIndex[m.From] {
 		n.matchIndex[m.From] = m.MatchIndex

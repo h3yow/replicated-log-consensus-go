@@ -128,6 +128,15 @@ func (s *Sim) Crash(id NodeID) {
 	s.logf("FAULT crash: node %d", id)
 }
 
+// Wipe 模拟"清空数据目录后重新上线"：持久化状态一并清除，
+// 节点以全新学习者身份等待重新入列（被摘节点重新加入的运维语义）。
+func (s *Sim) Wipe(id NodeID) {
+	s.storage[id] = NewMemoryStorage()
+	s.boot[id] = nil
+	s.spawn(id)
+	s.logf("FAULT wipe: node %d reset to pristine learner", id)
+}
+
 // Restart 从持久化存储重启节点。
 func (s *Sim) Restart(id NodeID) {
 	s.spawn(id)

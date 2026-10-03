@@ -15,6 +15,9 @@ type PersistentState struct {
 	// 当前已应用的成员配置（提交点处生效的配置）。
 	Voters   []NodeID
 	Learners []NodeID
+	// Removed 为 true 表示本节点曾被已提交的配置移出集群（转为非投票身份）。
+	// 显式持久化，避免把"尚未加入配置的全新学习者"误判为已移除。
+	Removed bool
 	// 快照点处的成员配置（随快照一起传播给落后节点/新节点）。
 	SnapVoters   []NodeID
 	SnapLearners []NodeID

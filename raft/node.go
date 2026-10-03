@@ -46,8 +46,9 @@ type Node struct {
 	// 学习者接收复制但不参选、不投票、不计入多数派。
 	voters   map[NodeID]bool
 	learners map[NodeID]bool
-	// removed 为 true 表示本节点已被移出配置：彻底停机，
-	// 不参选、不投票、不响应任何消息，避免凭旧认知扰动集群。
+	// removed 记录本节点是否曾被已提交的配置移出集群（可观察性标记）。
+	// 行为上与学习者一致：不参选、不投票，但仍跟随复制——
+	// 这样被重新加入时能继续追平并回归集群。
 	removed bool
 
 	// 选举状态
@@ -104,10 +105,9 @@ func NewNode(cfg Config, st Storage, rnd *rand.Rand) (*Node, error) {
 	for _, l := range boot.Learners {
 		n.learners[l] = true
 	}
-	// 配置非空但不含自己：本节点已被移出集群，进入停机状态。
-	if !boot.Empty() && !boot.Contains(cfg.ID) {
-		n.removed = true
-	}
+	// 移除状态显式持久化：只有"已提交的配置把先前在配置中的本节点排除"
+	// 才会置位（见 applyConfigEntry）；全新学习者配置为空属正常，不算被移除。
+	n.removed = ps.Removed
 	// 重启后：恢复持久化的提交点（至少覆盖快照点），
 	// lastApplied 从提交点开始，保证已应用内容不丢失、不重复。
 	n.commitIndex = ps.CommitIndex
@@ -143,6 +143,7 @@ func (n *Node) persist() {
 		SnapData:     append([]byte(nil), n.log.snapshotData...),
 		Voters:       conf.Voters,
 		Learners:     conf.Learners,
+		Removed:      n.removed,
 		SnapVoters:   n.log.snapVoters,
 		SnapLearners: n.log.snapLearners,
 	})
@@ -203,11 +204,14 @@ func (n *Node) LastLogIndex() Index                { return n.log.lastIndex() }
 func (n *Node) LastStepDown() StepDownReason       { return n.lastStepDown }
 func (n *Node) LastVoteDecision() VoteRejectReason { return n.lastVoteDecision }
 
-// Removed 报告本节点是否已被移出集群配置（停机状态）。
+// Removed 报告本节点是否曾被已提交的配置移出集群。
+// 被移出的节点行为等同学习者（不参选、不投票），但仍跟随复制，
+// 以便被重新加入时追平回归。
 func (n *Node) Removed() bool { return n.removed }
 
-// IsLearner 报告本节点当前是否为学习者（不计入多数派）。
-func (n *Node) IsLearner() bool { return !n.removed && n.learners[n.id] && !n.voters[n.id] }
+// IsLearner 报告本节点当前是否以非投票身份参与（学习者）。
+// 包括已纳入配置的学习者和尚未收到任何配置的全新节点。
+func (n *Node) IsLearner() bool { return !n.removed && !n.voters[n.id] }
 
 // AppliedConfig 返回当前已应用的成员配置（供测试与上层断言）。
 func (n *Node) AppliedConfig() ConfigState { return n.appliedConfig() }
@@ -229,9 +233,6 @@ func (n *Node) LogString() string {
 
 // Tick 推进一个逻辑时钟单位：选举超时与心跳都在此驱动。
 func (n *Node) Tick() {
-	if n.removed {
-		return // 已被移出集群：彻底停机
-	}
 	if n.role == Leader {
 		n.electionElapsed++
 		if n.electionElapsed >= n.cfg.HeartbeatTick {
@@ -241,7 +242,7 @@ func (n *Node) Tick() {
 		return
 	}
 	if !n.isVoter(n.id) {
-		return // 学习者不参选
+		return // 非投票成员（学习者/被移出的节点/全新节点）不参选
 	}
 	n.electionElapsed++
 	if n.electionElapsed >= n.electionTimeout {
@@ -252,9 +253,6 @@ func (n *Node) Tick() {
 
 // Step 处理一条入站消息。更高任期的消息一律先触发让位。
 func (n *Node) Step(m Message) {
-	if n.removed {
-		return // 已移出集群的节点不响应任何消息
-	}
 	// 拉票消息的成员资格前置检查：候选人不在当前投票成员内时，
 	// 直接拒绝且不抬升本地任期——被摘掉的节点（可能分区后恢复）
 	// 不能凭旧认知通过不断抬任期扰动集群。

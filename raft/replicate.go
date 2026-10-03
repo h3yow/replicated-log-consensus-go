@@ -118,6 +118,9 @@ func (n *Node) handleAppendEntriesResp(m Message) {
 	if n.role != Leader || m.Term != n.term {
 		return
 	}
+	if !n.isVoter(m.From) && !n.isLearner(m.From) {
+		return // 已移出配置的节点的迟到响应：忽略，不再向其复制
+	}
 	if m.Success {
 		if m.MatchIndex > n.matchIndex[m.From] {
 			n.matchIndex[m.From] = m.MatchIndex

@@ -9,8 +9,8 @@ package raft
 //     因此任意新旧两个配置的多数派必然相交，集群不会被劈成两半。
 //   - 扩容两段式：先以学习者身份加入（不计入多数派，追平前不影响提交点推进），
 //     追平后由领导者自动追加"提升为投票成员"的配置条目。
-//   - 缩容：被摘节点应用移除条目后停机；未学到移除的节点恢复后，
-//     其拉票被"候选人必须在当前投票成员内"规则拒绝且不抬任期。
+//   - 缩容：被摘节点应用移除条目后转为非投票身份（仍跟随复制，可被重新加入）；
+//     未学到移除的节点恢复后，其拉票被"候选人必须在当前投票成员内"规则拒绝且不抬任期。
 
 // hasPendingConfigChange 报告日志中是否存在已追加但未提交的配置条目。
 func (n *Node) hasPendingConfigChange() bool {
@@ -116,6 +116,10 @@ func sortNodeIDs(ids []NodeID) {
 // 领导者为新加入的复制对象初始化进度。
 func (n *Node) applyConfigEntry(e Entry) {
 	conf := e.Config
+	// 是否被移除：先前已在配置中、且新提交的配置不再包含本节点。
+	// （全新学习者追快照历史时会应用到"尚不含自己"的旧配置条目，
+	//   那不属于被移除，不能停机。）
+	wasMember := n.isVoter(n.id) || n.isLearner(n.id)
 	n.voters = make(map[NodeID]bool, len(conf.Voters))
 	for _, v := range conf.Voters {
 		n.voters[v] = true
@@ -124,17 +128,20 @@ func (n *Node) applyConfigEntry(e Entry) {
 	for _, l := range conf.Learners {
 		n.learners[l] = true
 	}
-	n.persist()
-
-	if !conf.Contains(n.id) {
-		// 本节点被移出集群：让位并彻底停机。
+	if wasMember && !conf.Contains(n.id) {
+		// 本节点被已提交的配置移出集群：让位并转为非投票身份。
 		// 该移除条目已被多数派提交，新配置无需本节点即可选主。
+		// 注意不是"停机"：节点仍跟随复制，将来被重新加入时可追平回归。
 		if n.role != Follower {
 			n.becomeFollower(n.term, StepDownNone)
 		}
 		n.removed = true
-		return
 	}
+	if conf.Contains(n.id) {
+		n.removed = false // 被重新加入（或本来就在配置中）
+	}
+	n.persist()
+
 	if n.role == Leader {
 		// 新出现的复制对象（如刚加入的学习者）初始化复制进度。
 		for _, p := range n.replicationTargets() {
