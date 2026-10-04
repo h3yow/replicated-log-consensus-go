@@ -16,8 +16,11 @@ func (n *Node) becomeFollower(term Term, reason StepDownReason) {
 	n.resetElectionTimeout()
 }
 
-// startElection 发起新一轮选举。
+// startElection 发起新一轮选举。只有当前配置中的投票成员才能竞选。
 func (n *Node) startElection() {
+	if !n.isVoter(n.id) {
+		return
+	}
 	n.role = Candidate
 	n.term++
 	n.votedFor = n.id
@@ -26,11 +29,11 @@ func (n *Node) startElection() {
 	n.votesReceived = map[NodeID]bool{n.id: true}
 	n.resetElectionTimeout()
 	// 单节点集群立即当选。
-	if n.cfg.quorum() == 1 {
+	if n.quorum() == 1 {
 		n.becomeLeader()
 		return
 	}
-	for _, p := range n.cfg.Peers {
+	for _, p := range n.Voters() {
 		if p == n.id {
 			continue
 		}
@@ -46,11 +49,12 @@ func (n *Node) startElection() {
 }
 
 // becomeLeader 当选领导者，初始化复制状态并立即广播心跳确立权威。
+// 复制对象 = 当前投票成员 + 学习者 + 未提交变更的被摘除者。
 func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.nextIndex = make(map[NodeID]Index)
 	n.matchIndex = make(map[NodeID]Index)
-	for _, p := range n.cfg.Peers {
+	for _, p := range n.replicationTargets() {
 		n.nextIndex[p] = n.log.lastIndex() + 1
 		n.matchIndex[p] = 0
 	}
@@ -72,7 +76,25 @@ func (n *Node) isUpToDate(idx Index, term Term) bool {
 }
 
 // handleRequestVote 处理投票请求，给出可区分的拒绝原因。
+// 关键成员规则：候选人必须是本节点当前配置中的投票成员，
+// 否则既不投票也不采纳其任期——被摘除的节点即使带着更高任期回来，
+// 也不能迫使集群让位或重新计票。
 func (n *Node) handleRequestVote(m Message) {
+	if !n.isVoter(m.From) {
+		n.lastVoteDecision = RejectNotMember
+		n.outbox = append(n.outbox, Message{
+			Type:         MsgRequestVoteResp,
+			From:         n.id,
+			To:           m.From,
+			Term:         n.term,
+			VoteGranted:  false,
+			RejectReason: RejectNotMember,
+		})
+		return
+	}
+	if m.Term > n.term {
+		n.becomeFollower(m.Term, StepDownHigherTerm)
+	}
 	grant := false
 	reason := VoteGranted
 	switch {
@@ -104,13 +126,14 @@ func (n *Node) handleRequestVote(m Message) {
 }
 
 // handleRequestVoteResp 处理投票响应；候选人获得多数票即当选。
+// 只统计当前配置中投票成员的票（迟到的、非成员的响应不计入）。
 func (n *Node) handleRequestVoteResp(m Message) {
 	if n.role != Candidate || m.Term != n.term {
 		return
 	}
-	if m.VoteGranted {
+	if m.VoteGranted && n.isVoter(m.From) {
 		n.votesReceived[m.From] = true
-		if len(n.votesReceived) >= n.cfg.quorum() {
+		if len(n.votesReceived) >= n.quorum() {
 			n.becomeLeader()
 		}
 	}

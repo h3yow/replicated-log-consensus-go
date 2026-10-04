@@ -3,10 +3,14 @@ package raft
 // raftLog 维护带快照前缀的复制日志。
 // 布局：snapshotLastIndex/snapshotLastTerm + entries[0..]，
 // entries[0] 的逻辑索引为 snapshotLastIndex+1。
+// 快照元数据同时记录快照点处的成员配置（投票成员与学习者），
+// 使重启/快照安装后能从该点重新推导当前配置。
 type raftLog struct {
 	snapshotLastIndex Index
 	snapshotLastTerm  Term
 	snapshotData      []byte
+	snapshotVoters    []NodeID // 快照点处的投票成员
+	snapshotLearners  []NodeID // 快照点处的学习者
 	entries           []Entry
 }
 
@@ -68,8 +72,9 @@ func (l *raftLog) append(entries ...Entry) {
 }
 
 // compactTo 将 upto（含）之前的日志压缩为快照前缀。
-// upto 必须 <= lastIndex。data 为快照内容。
-func (l *raftLog) compactTo(upto Index, data []byte) {
+// upto 必须 <= lastIndex。data 为快照内容；
+// voters/learners 为 upto 这一点处的成员配置（由调用方推导）。
+func (l *raftLog) compactTo(upto Index, data []byte, voters, learners []NodeID) {
 	if upto <= l.snapshotLastIndex {
 		return
 	}
@@ -81,12 +86,14 @@ func (l *raftLog) compactTo(upto Index, data []byte) {
 	l.snapshotLastIndex = upto
 	l.snapshotLastTerm = term
 	l.snapshotData = data
+	l.snapshotVoters = append([]NodeID(nil), voters...)
+	l.snapshotLearners = append([]NodeID(nil), learners...)
 }
 
 // installSnapshot 用快照替换前缀；若本地存在与快照末点匹配的条目，
 // 则保留其后的更长后缀，否则丢弃全部本地条目。
-// 返回是否保留了后缀。
-func (l *raftLog) installSnapshot(lastIndex Index, lastTerm Term, data []byte) bool {
+// 同时采纳快照携带的成员配置。返回是否保留了后缀。
+func (l *raftLog) installSnapshot(lastIndex Index, lastTerm Term, data []byte, voters, learners []NodeID) bool {
 	keepSuffix := false
 	if t, ok := l.termAt(lastIndex); ok && t == lastTerm && lastIndex > l.snapshotLastIndex {
 		keepSuffix = true
@@ -97,5 +104,7 @@ func (l *raftLog) installSnapshot(lastIndex Index, lastTerm Term, data []byte) b
 	l.snapshotLastIndex = lastIndex
 	l.snapshotLastTerm = lastTerm
 	l.snapshotData = data
+	l.snapshotVoters = append([]NodeID(nil), voters...)
+	l.snapshotLearners = append([]NodeID(nil), learners...)
 	return keepSuffix
 }

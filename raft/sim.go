@@ -18,6 +18,11 @@ type Sim struct {
 	rnd     *rand.Rand
 	seed    int64
 
+	// bootPeers 记录每个节点首次引导时的初始成员（空存储时生效）。
+	// 动态加入的节点引导配置为空——它们以空配置启动，
+	// 等待领导者通过快照/日志把当前配置送过来。
+	bootPeers map[NodeID][]NodeID
+
 	tick int
 	seq  int
 
@@ -50,24 +55,32 @@ func NewSim(n int, cfg Config, seed int64) *Sim {
 	s := &Sim{
 		nodes:     make(map[NodeID]*Node),
 		storage:   make(map[NodeID]*MemoryStorage),
+		bootPeers: make(map[NodeID][]NodeID),
 		cfg:       cfg,
 		rnd:       rand.New(rand.NewSource(seed)),
 		seed:      seed,
 		partition: make(map[NodeID]bool),
 	}
 	for _, id := range peers {
-		c := cfg
-		c.ID = id
-		st := NewMemoryStorage()
-		node, err := NewNode(c, st, rand.New(rand.NewSource(seed+int64(id)*7919)))
-		if err != nil {
-			panic(err)
-		}
-		s.nodes[id] = node
-		s.storage[id] = st
+		s.bootPeers[id] = peers
+		s.spawn(id)
 	}
 	s.logf("sim init: nodes=%v seed=%d", peers, seed)
 	return s
+}
+
+// spawn 以指定引导配置创建一个节点（含独立存储）。
+func (s *Sim) spawn(id NodeID) {
+	c := s.cfg
+	c.ID = id
+	c.Peers = s.bootPeers[id]
+	st := NewMemoryStorage()
+	node, err := NewNode(c, st, rand.New(rand.NewSource(s.seed+int64(id)*7919)))
+	if err != nil {
+		panic(err)
+	}
+	s.nodes[id] = node
+	s.storage[id] = st
 }
 
 func (s *Sim) logf(format string, args ...interface{}) {
@@ -105,16 +118,57 @@ func (s *Sim) Crash(id NodeID) {
 	s.logf("FAULT crash: node %d", id)
 }
 
-// Restart 从持久化存储重启节点。
+// Restart 从持久化存储重启节点（成员配置由持久化日志推导，不依赖引导配置）。
 func (s *Sim) Restart(id NodeID) {
 	c := s.cfg
 	c.ID = id
+	c.Peers = s.bootPeers[id]
 	node, err := NewNode(c, s.storage[id], rand.New(rand.NewSource(s.seed+int64(id)*7919+int64(s.tick))))
 	if err != nil {
 		panic(err)
 	}
 	s.nodes[id] = node
-	s.logf("FAULT restart: node %d term=%d commit=%d", id, node.Term(), node.CommitIndex())
+	s.logf("FAULT restart: node %d term=%d commit=%d voters=%v learners=%v",
+		id, node.Term(), node.CommitIndex(), node.Voters(), node.Learners())
+}
+
+// --- 动态成员变更 ---
+
+// AddNode 运行期扩容：若节点不存在则以空配置生成，
+// 再请当前领导者发起"加入学习者"变更。返回 false 表示本次未发起
+// （无领导者或领导者正忙），调用方可于后续 tick 重试。
+func (s *Sim) AddNode(id NodeID) bool {
+	if _, ok := s.nodes[id]; !ok {
+		s.bootPeers[id] = nil // 空配置启动：等待领导者送来当前配置
+		s.spawn(id)
+		s.logf("CONF spawn: node %d 以空配置启动，等待追赶", id)
+	}
+	leader, ok := s.Leader()
+	if !ok {
+		return false
+	}
+	if !s.nodes[leader].AddNode(id) {
+		return false
+	}
+	s.logf("CONF add: leader=%d 提议加入 node %d (learner) term=%d", leader, id, s.nodes[leader].Term())
+	return true
+}
+
+// RemoveNode 运行期缩容：请当前领导者发起摘除变更。
+// 只向"未被隔离"的领导者提议（被隔离领导者的变更无法提交，
+// 且会让被摘除者意外学到变更，失去分区场景的测试意义）。
+func (s *Sim) RemoveNode(id NodeID) bool {
+	for _, nid := range s.sortedIDs() {
+		if s.partition[nid] {
+			continue
+		}
+		n := s.nodes[nid]
+		if n.Role() == Leader && n.RemoveNode(id) {
+			s.logf("CONF remove: leader=%d 提议摘除 node %d term=%d", nid, id, n.Term())
+			return true
+		}
+	}
+	return false
 }
 
 // disconnected 判定一条消息是否被分区阻断。
@@ -222,8 +276,8 @@ func (s *Sim) DumpState() string {
 	var b strings.Builder
 	for _, id := range s.sortedIDs() {
 		n := s.nodes[id]
-		fmt.Fprintf(&b, "node=%d role=%s term=%d commit=%d log=%s\n",
-			id, n.Role(), n.Term(), n.CommitIndex(), n.LogString())
+		fmt.Fprintf(&b, "node=%d role=%s term=%d commit=%d voters=%v learners=%v log=%s\n",
+			id, n.Role(), n.Term(), n.CommitIndex(), n.Voters(), n.Learners(), n.LogString())
 	}
 	return b.String()
 }

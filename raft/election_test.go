@@ -97,16 +97,21 @@ func TestVoteRejectReasons(t *testing.T) {
 	sim.Node(leader).Propose([]byte("cmd-1"))
 	sim.Run(20)
 
-	// 场景1：过期任期的投票请求 → RejectStaleTerm。
 	follower := NodeID(0)
+	third := NodeID(0)
 	for _, id := range []NodeID{1, 2, 3} {
 		if id != leader {
-			follower = id
-			break
+			if follower == 0 {
+				follower = id
+			} else {
+				third = id
+			}
 		}
 	}
 	f := sim.Node(follower)
-	f.Step(Message{Type: MsgRequestVote, From: 99, To: follower, Term: f.Term() - 1})
+
+	// 场景1：过期任期的投票请求（来自成员）→ RejectStaleTerm。
+	f.Step(Message{Type: MsgRequestVote, From: third, To: follower, Term: f.Term() - 1})
 	if f.LastVoteDecision() != RejectStaleTerm {
 		t.Fatalf("期望 RejectStaleTerm，得到 %s", f.LastVoteDecision())
 	}
@@ -116,24 +121,37 @@ func TestVoteRejectReasons(t *testing.T) {
 	// 用与本地日志完全一致的信息请求更高任期，应先被批准。
 	lastIdx := f.LastLogIndex()
 	lastEntry, _ := f.EntryAt(lastIdx)
-	f.Step(Message{Type: MsgRequestVote, From: 98, To: follower, Term: f.Term() + 1,
+	f.Step(Message{Type: MsgRequestVote, From: third, To: follower, Term: f.Term() + 1,
 		LastLogIndex: lastIdx, LastLogTerm: lastEntry.Term})
 	if f.LastVoteDecision() != VoteGranted {
 		t.Fatalf("期望 VoteGranted，得到 %s", f.LastVoteDecision())
 	}
-	f.Step(Message{Type: MsgRequestVote, From: 97, To: follower, Term: f.Term(),
+	f.Step(Message{Type: MsgRequestVote, From: leader, To: follower, Term: f.Term(),
 		LastLogIndex: lastIdx, LastLogTerm: lastEntry.Term})
 	if f.LastVoteDecision() != RejectAlreadyVoted {
 		t.Fatalf("期望 RejectAlreadyVoted，得到 %s", f.LastVoteDecision())
 	}
 	t.Logf("node=%d 拒绝重复投票: reason=%s", follower, f.LastVoteDecision())
 
-	// 场景3：候选人日志落后 → RejectLogNotUpToDate。
+	// 场景3：候选人日志落后（来自成员）→ RejectLogNotUpToDate。
 	f2 := sim.Node(leader) // 领导者日志最新
-	f2.Step(Message{Type: MsgRequestVote, From: 96, To: leader, Term: f2.Term() + 1,
+	f2.Step(Message{Type: MsgRequestVote, From: follower, To: leader, Term: f2.Term() + 1,
 		LastLogIndex: 0, LastLogTerm: 0})
 	if f2.LastVoteDecision() != RejectLogNotUpToDate {
 		t.Fatalf("期望 RejectLogNotUpToDate，得到 %s", f2.LastVoteDecision())
 	}
 	t.Logf("node=%d 拒绝日志落后候选人: reason=%s", leader, f2.LastVoteDecision())
+
+	// 场景4：非成员候选人 → RejectNotMember，且其更高任期不被采纳
+	// （被摘除节点不得凭旧认知扰乱集群）。
+	before := f.Term()
+	f.Step(Message{Type: MsgRequestVote, From: 99, To: follower, Term: before + 5,
+		LastLogIndex: lastIdx, LastLogTerm: lastEntry.Term})
+	if f.LastVoteDecision() != RejectNotMember {
+		t.Fatalf("期望 RejectNotMember，得到 %s", f.LastVoteDecision())
+	}
+	if f.Term() != before {
+		t.Fatalf("非成员候选人的任期被采纳: term %d -> %d", before, f.Term())
+	}
+	t.Logf("node=%d 拒绝非成员候选人: reason=%s 本地任期保持=%d", follower, f.LastVoteDecision(), f.Term())
 }

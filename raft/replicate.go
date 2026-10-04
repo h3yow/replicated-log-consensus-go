@@ -18,7 +18,7 @@ func (n *Node) sendAppend(to NodeID) {
 	if n.cfg.MaxEntriesPerMsg > 0 && last-prevIdx > Index(n.cfg.MaxEntriesPerMsg) {
 		max = prevIdx + Index(n.cfg.MaxEntriesPerMsg)
 	}
-	n.outbox = append(n.outbox, Message{
+	m := Message{
 		Type:         MsgAppendEntries,
 		From:         n.id,
 		To:           to,
@@ -27,14 +27,34 @@ func (n *Node) sendAppend(to NodeID) {
 		PrevLogTerm:  prevTerm,
 		Entries:      n.log.slice(prevIdx+1, max),
 		LeaderCommit: n.commitIndex,
-	})
+	}
+	if prevIdx == n.log.snapshotLastIndex {
+		// 条目直接挂在快照点上：随消息带上快照点的基准成员配置，
+		// 使空配置的追赶者能获得初始成员（见 Message.PrevVoters 注释）。
+		m.PrevVoters = append([]NodeID(nil), n.log.snapshotVoters...)
+		m.PrevLearners = append([]NodeID(nil), n.log.snapshotLearners...)
+	}
+	n.outbox = append(n.outbox, m)
 }
 
-// broadcastAppend 向所有对等节点发送复制消息。
+// broadcastAppend 向所有复制对象（投票成员 + 学习者 + 未提交变更的被摘除者）发送复制消息。
 func (n *Node) broadcastAppend() {
-	for _, p := range n.cfg.Peers {
-		if p != n.id {
-			n.sendAppend(p)
+	for _, p := range n.replicationTargets() {
+		n.sendAppend(p)
+	}
+}
+
+// ensureTrackers 保证领导者为每个复制对象都维护了进度：
+// 新出现的成员（如刚加入的学习者）从索引 1 开始追赶——
+// 历史若已压缩，sendAppend 会自动改发快照。
+func (n *Node) ensureTrackers() {
+	if n.role != Leader {
+		return
+	}
+	for _, p := range n.replicationTargets() {
+		if _, ok := n.nextIndex[p]; !ok {
+			n.nextIndex[p] = 1
+			n.matchIndex[p] = 0
 		}
 	}
 }
@@ -76,6 +96,16 @@ func (n *Node) handleAppendEntries(m Message) {
 		return
 	}
 
+	// 条目挂在快照点上且发送者携带了基准成员配置：
+	// 若本地快照点相同，采纳其基准配置（空配置追赶者由此获得初始成员）。
+	// 同一 (index,term) 前缀的日志必然一致，采纳总是安全的。
+	baseChanged := false
+	if m.PrevLogIndex == n.log.snapshotLastIndex && m.PrevVoters != nil {
+		n.log.snapshotVoters = append([]NodeID(nil), m.PrevVoters...)
+		n.log.snapshotLearners = append([]NodeID(nil), m.PrevLearners...)
+		baseChanged = true
+	}
+
 	// 逐条对齐：发现任期冲突即截断后缀，再追加缺失条目。
 	changed := false
 	for i, e := range m.Entries {
@@ -94,7 +124,10 @@ func (n *Node) handleAppendEntries(m Message) {
 		}
 		// 已存在且一致：重复投递/乱序到达时安全跳过（幂等）。
 	}
-	if changed {
+	if changed || baseChanged {
+		// 成员变更条目追加即生效；若截断丢弃了未提交的变更，
+		// 重新推导配置使其随日志一起回滚。
+		n.recomputeMembership()
 		n.persist()
 	}
 
@@ -126,6 +159,7 @@ func (n *Node) handleAppendEntriesResp(m Message) {
 			n.nextIndex[m.From] = m.MatchIndex + 1
 		}
 		n.maybeCommit()
+		n.maybePromoteLearners()
 		return
 	}
 	// 失败：按冲突提示回退 nextIndex 并重试。
@@ -156,7 +190,8 @@ func (n *Node) handleAppendEntriesResp(m Message) {
 	n.sendAppend(m.From)
 }
 
-// maybeCommit 只提交"被多数派复制且不早于当前任期"的条目（Raft §5.4.2）。
+// maybeCommit 只提交"被当前投票成员多数派复制且不早于当前任期"的条目（Raft §5.4.2）。
+// 多数派按当前生效配置计算；配置变更期间新旧多数派必然相交（单节点变更）。
 func (n *Node) maybeCommit() {
 	for idx := n.log.lastIndex(); idx > n.commitIndex; idx-- {
 		t, _ := n.log.termAt(idx)
@@ -164,17 +199,29 @@ func (n *Node) maybeCommit() {
 			break // 更早任期的条目只能随本任期条目间接收尾
 		}
 		count := 0
-		for _, p := range n.cfg.Peers {
+		for _, p := range n.Voters() {
 			if n.matchIndex[p] >= idx {
 				count++
 			}
 		}
-		if count >= n.cfg.quorum() {
+		if count >= n.quorum() {
 			n.commitIndex = idx
 			n.persist()
 			n.maybeApply()
+			n.maybeStepDownRemoved()
 			break
 		}
+	}
+}
+
+// maybeStepDownRemoved 领导者发现自己已被提交的配置摘除时让位：
+// 被摘除的节点不再参与多数派判定，也不得继续以领导者身份影响集群。
+func (n *Node) maybeStepDownRemoved() {
+	if n.role != Leader || n.isVoter(n.id) {
+		return
+	}
+	if n.lastConfIdx > 0 && n.lastConfIdx <= n.commitIndex {
+		n.becomeFollower(n.term, StepDownRemoved)
 	}
 }
 

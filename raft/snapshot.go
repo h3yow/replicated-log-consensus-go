@@ -1,6 +1,7 @@
 package raft
 
 // compact 将 upto（含）之前的日志压缩为快照前缀并持久化。
+// 快照元数据记录 upto 这一点处的成员配置，使快照之后的配置仍可推导。
 func (n *Node) compact(upto Index, data []byte) {
 	if upto > n.commitIndex {
 		upto = n.commitIndex // 只允许压缩已提交的前缀
@@ -8,11 +9,12 @@ func (n *Node) compact(upto Index, data []byte) {
 	if upto <= n.log.snapshotLastIndex {
 		return
 	}
-	n.log.compactTo(upto, append([]byte(nil), data...))
+	voters, learners := n.membershipAt(upto)
+	n.log.compactTo(upto, append([]byte(nil), data...), voters, learners)
 	n.persist()
 }
 
-// sendSnapshot 向落后节点发送快照。
+// sendSnapshot 向落后节点发送快照（含快照点处的成员配置）。
 func (n *Node) sendSnapshot(to NodeID) {
 	n.outbox = append(n.outbox, Message{
 		Type:              MsgInstallSnapshot,
@@ -22,6 +24,8 @@ func (n *Node) sendSnapshot(to NodeID) {
 		SnapshotLastIndex: n.log.snapshotLastIndex,
 		SnapshotLastTerm:  n.log.snapshotLastTerm,
 		SnapshotData:      append([]byte(nil), n.log.snapshotData...),
+		SnapshotVoters:    append([]NodeID(nil), n.log.snapshotVoters...),
+		SnapshotLearners:  append([]NodeID(nil), n.log.snapshotLearners...),
 	})
 }
 
@@ -44,8 +48,11 @@ func (n *Node) handleInstallSnapshot(m Message) {
 		return
 	}
 
-	kept := n.log.installSnapshot(m.SnapshotLastIndex, m.SnapshotLastTerm, m.SnapshotData)
+	kept := n.log.installSnapshot(m.SnapshotLastIndex, m.SnapshotLastTerm, m.SnapshotData,
+		m.SnapshotVoters, m.SnapshotLearners)
 	_ = kept
+	// 采纳快照携带的成员配置；若保留了更长后缀，后缀中的变更条目继续生效。
+	n.recomputeMembership()
 	// 提交点/应用点至少推进到快照末点；快照内容作为一条应用消息交给状态机。
 	if n.commitIndex < m.SnapshotLastIndex {
 		n.commitIndex = m.SnapshotLastIndex
@@ -73,4 +80,5 @@ func (n *Node) handleInstallSnapshotResp(m Message) {
 		n.nextIndex[m.From] = m.MatchIndex + 1
 	}
 	n.sendAppend(m.From)
+	n.maybePromoteLearners() // 学习者可能借快照追平
 }

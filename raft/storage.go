@@ -12,6 +12,16 @@ type PersistentState struct {
 	SnapIndex   Index
 	SnapTerm    Term
 	SnapData    []byte
+	// 快照点处的成员配置：重启后以此为基底、回放快照之后的日志条目，
+	// 重新推导当前生效的成员配置（投票成员 + 学习者）。
+	SnapVoters   []NodeID
+	SnapLearners []NodeID
+}
+
+// isEmpty 判定存储是否从未写入过（用于区分"首次引导"与"重启恢复"）。
+func (s PersistentState) isEmpty() bool {
+	return s.CurrentTerm == 0 && !s.HasVoted && s.CommitIndex == 0 &&
+		len(s.Log) == 0 && s.SnapIndex == 0
 }
 
 // Storage 抽象持久化存储。MemoryStorage 支持"崩溃-重启"语义：
@@ -49,5 +59,7 @@ func cloneState(s PersistentState) PersistentState {
 	out := s
 	out.Log = append([]Entry(nil), s.Log...)
 	out.SnapData = append([]byte(nil), s.SnapData...)
+	out.SnapVoters = append([]NodeID(nil), s.SnapVoters...)
+	out.SnapLearners = append([]NodeID(nil), s.SnapLearners...)
 	return out
 }

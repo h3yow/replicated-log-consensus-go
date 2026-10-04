@@ -51,6 +51,12 @@ type Message struct {
 	PrevLogTerm  Term
 	Entries      []Entry
 	LeaderCommit Index
+	// PrevVoters/PrevLearners 仅当 PrevLogIndex 恰好是发送者的快照点时携带：
+	// 接收者若也以该点为快照点（典型场景：全新空节点从索引 1 开始追赶），
+	// 则采纳该基准成员配置——初始配置只存在于索引 0 的快照元数据中，
+	// 不随普通条目传播，必须由此显式传递。
+	PrevVoters   []NodeID
+	PrevLearners []NodeID
 
 	// AppendEntriesResp 字段
 	Success         bool
@@ -64,4 +70,6 @@ type Message struct {
 	SnapshotLastIndex Index
 	SnapshotLastTerm  Term
 	SnapshotData      []byte
+	SnapshotVoters    []NodeID // 快照点处的成员配置（随快照一起传播）
+	SnapshotLearners  []NodeID
 }
