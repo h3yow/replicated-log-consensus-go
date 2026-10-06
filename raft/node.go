@@ -93,10 +93,18 @@ func NewNode(cfg Config, st Storage, rnd *rand.Rand) (*Node, error) {
 	n.log.snapshotData = ps.SnapData
 	n.log.snapshotVoters = append([]NodeID(nil), ps.SnapVoters...)
 	n.log.snapshotLearners = append([]NodeID(nil), ps.SnapLearners...)
+	upgraded := false
 	if ps.isEmpty() {
 		// 首次引导：以 Config.Peers 为初始投票成员（可能为空，
 		// 空配置表示该节点等待以学习者身份被加入集群）。
 		n.log.snapshotVoters = append([]NodeID(nil), cfg.Peers...)
+	} else if ps.lacksMembershipInfo() {
+		// 升级路径：状态来自不支持动态成员的旧版本——有历史任期/日志/
+		// 提交点，但没有任何成员信息。旧版本成员关系是静态的，即启动时
+		// 给定的初始成员配置，因此以 Config.Peers 为基准投票成员恢复身份。
+		// 被动态摘除过的节点状态里必有变更条目或快照成员，不会走到这里。
+		n.log.snapshotVoters = append([]NodeID(nil), cfg.Peers...)
+		upgraded = len(cfg.Peers) > 0
 	}
 	// 重启后：恢复持久化的提交点（至少覆盖快照点），
 	// lastApplied 从提交点开始，保证已应用内容不丢失、不重复。
@@ -108,6 +116,11 @@ func NewNode(cfg Config, st Storage, rnd *rand.Rand) (*Node, error) {
 	// 成员配置一律从"快照成员 + 日志条目"重新推导，
 	// 保证与持久化日志一致（未提交却被截断的变更不会残留）。
 	n.recomputeMembership()
+	if upgraded {
+		// 把恢复出的成员配置立即落盘：重启前后成员视图一致，
+		// 后续重启直接读持久化成员，不再依赖引导配置是否给对。
+		n.persist()
+	}
 	n.resetElectionTimeout()
 	return n, nil
 }

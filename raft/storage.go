@@ -24,6 +24,25 @@ func (s PersistentState) isEmpty() bool {
 		len(s.Log) == 0 && s.SnapIndex == 0
 }
 
+// lacksMembershipInfo 判定持久化状态是否完全不含成员信息：
+// 快照未携带成员、且日志中没有任何成员变更条目。
+// 状态非空却满足该条件，说明它来自不支持动态成员的旧版本
+// （旧版本只有静态成员，既不写快照成员也不产生变更条目）；
+// 反之，只要出现过任何动态成员行为（含"被摘除"），状态里必然
+// 留有快照成员或变更条目，不会误判。因此该判定可把
+// "旧版本升级上来的节点"与"被动态摘除的节点"严格区分开。
+func (s PersistentState) lacksMembershipInfo() bool {
+	if len(s.SnapVoters) > 0 || len(s.SnapLearners) > 0 {
+		return false
+	}
+	for _, e := range s.Log {
+		if e.Type == EntryConfig {
+			return false
+		}
+	}
+	return true
+}
+
 // Storage 抽象持久化存储。MemoryStorage 支持"崩溃-重启"语义：
 // 崩溃后可通过 Snapshot() 恢复出重启前最后一次持久化的状态。
 type Storage interface {
