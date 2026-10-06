@@ -18,10 +18,20 @@ type PersistentState struct {
 	SnapLearners []NodeID
 }
 
-// isEmpty 判定存储是否从未写入过（用于区分"首次引导"与"重启恢复"）。
-func (s PersistentState) isEmpty() bool {
-	return s.CurrentTerm == 0 && !s.HasVoted && s.CommitIndex == 0 &&
-		len(s.Log) == 0 && s.SnapIndex == 0
+// hasNoMembershipInfo 判定持久化状态中是否完全不含成员配置信息。
+// 上一版本的 PersistentState 没有成员字段、日志中也没有成员变更条目，
+// 带这种历史状态升级的节点命中此判定，启动时回退到 Config.Peers；
+// 而任何经动态变更（含摘除）过的状态都带有成员信息，不会误判。
+func (s PersistentState) hasNoMembershipInfo() bool {
+	if len(s.SnapVoters) > 0 || len(s.SnapLearners) > 0 {
+		return false
+	}
+	for _, e := range s.Log {
+		if e.Type == EntryConfig {
+			return false
+		}
+	}
+	return true
 }
 
 // Storage 抽象持久化存储。MemoryStorage 支持"崩溃-重启"语义：

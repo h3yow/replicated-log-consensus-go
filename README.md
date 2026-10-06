@@ -75,25 +75,39 @@
   `PrevVoters/PrevLearners`，接收者据此采纳基准配置；经快照追赶时则由
   `InstallSnapshot` 直接携带。
 
-### 兼容范围
+### 兼容范围与旧版本升级路径
 
-- **持久化状态**：`PersistentState` 新增 `SnapVoters/SnapLearners`（快照点成员）。
-  旧格式状态（无这两个字段）加载后视为"快照点无成员记录"：对从未压缩的日志，
-  成员由引导配置（`Config.Peers`）建立，行为与旧版一致；一旦发生过压缩，
-  快照元数据即携带成员，新旧状态自然衔接。
+- **持久化状态**：`PersistentState` 相对上一版本新增 `SnapVoters/SnapLearners`
+  （快照点成员）。旧版本写出的状态没有这两个字段，日志中也不会有成员变更条目
+  （旧版本成员是静态的 `Config.Peers`）。
+- **升级路径的预期行为**：节点重启恢复时，若持久化状态非空但**完全不含成员信息**
+  （无快照成员、日志中无任何 `EntryConfig` 条目，`hasNoMembershipInfo`），
+  判定为"从旧版本升级"，以本次启动传入的 `Config.Peers` 作为成员基底——
+  这与旧版本的静态成员语义一致。因此带历史状态（任期、日志、提交点、快照均非
+  初始值）升级来的节点，重启后照常认出成员身份、参与选举与投票
+  （`TestUpgradeRestartElectsLeader`、`TestUpgradeRestartWithSnapshot`）。
+  恢复出的成员会在下一次持久化时随 `SnapVoters` 写回存储，此后反复重启
+  不再依赖引导配置、视图不漂移（`TestUpgradeRestartMembershipStableAcrossRestarts`）。
+- **不会误判的保护**：只要持久化状态里存在任何成员信息（快照成员或日志中的
+  变更条目），就一律以持久化状态为准、忽略 `Config.Peers`。因此**确实被动态
+  摘除过**的节点（其日志/快照中留有摘除记录）重启后仍是非成员，不会被回退
+  逻辑误判回集群（`TestRemovedNodeStaysNonMemberAfterRestart`）。
+- **混合部署**：同一集群里新格式状态与旧格式状态的节点混跑时，选举、提交、
+  动态扩缩容照常进行，所有节点最终收敛到同一份成员配置
+  （`TestUpgradeMixedClusterConverges`）。
 - **快照**：扩容前生成的快照（含当时的成员配置）在扩容后依然有效——
   安装快照的节点以快照成员为基底、继续应用其后的变更条目，最终推导出的
   配置与集群一致。反之亦然。
 - **消息**：`AppendEntries` 的 `PrevVoters/PrevLearners` 仅在条目挂在快照点时
   携带，为空时接收方忽略，不影响既有复制路径。
-- **滚动升级**：本组件以进程内库形式演进，无线上协议兼容承诺；
-  同一集群内所有节点应运行同一版本。
+- **滚动升级**：升级只要求重启时传入与旧版本一致的 `Config.Peers`；
+  无线上协议兼容承诺，同一集群内所有节点应运行同一版本。
 
 ## 可调参数（`raft.Config`）
 
 | 参数 | 含义 | 说明 |
 |---|---|---|
-| `Peers` | 初始引导成员（含自身） | 仅在空存储首次启动时生效；此后成员由日志中的变更条目决定。动态加入的节点传空 |
+| `Peers` | 初始引导成员（含自身） | 在空存储首次启动、或持久化状态不含任何成员信息（旧版本升级）时生效；此后成员由日志中的变更条目决定。动态加入的节点传空 |
 | `ElectionTimeout` | 选举超时基准（tick） | 实际超时随机化为 `[T, 2T)` |
 | `HeartbeatTick` | 心跳间隔（tick） | 应显著小于 ElectionTimeout |
 | `MaxEntriesPerMsg` | 单条 AppendEntries 最大条目数 | 0 表示不限 |
@@ -131,6 +145,17 @@ go test ./... -v
     全程断言选举安全性与状态机安全性，收尾断言成员视图、提交点、应用序列最终一致；
   - `TestMembershipSurvivesRestart`：变更进行中重启，配置从持久化状态正确恢复；
   - `TestMembershipDeterministicReplay`：含扩缩容的运行在相同种子下逐字节重放。
+- `upgrade_test.go`：旧版本升级路径——
+  - `TestUpgradeRestartElectsLeader`：带旧格式历史状态（任期/日志/提交点非初始值）
+    的节点重启后认出成员身份、重新选出领导者、提交点继续推进；
+  - `TestUpgradeRestartWithSnapshot`：旧状态已含快照（无成员元数据）时，
+    快照点与提交点不丢失，升级后照常选举与提交；
+  - `TestUpgradeMixedClusterConverges`：新旧格式状态混跑，动态扩容后
+    全部节点收敛到同一份成员配置；
+  - `TestRemovedNodeStaysNonMemberAfterRestart`：被动态摘除的节点重启后
+    仍是非成员，回退逻辑不误判；
+  - `TestUpgradeRestartMembershipStableAcrossRestarts`：恢复出的成员配置
+    写回持久化存储，反复重启视图不漂移。
 - `fault_injection_test.go`：固定种子下 5 节点、400 tick 内随机注入
   分区/丢包/重复/乱序/崩溃重启，全程断言：
   - **选举安全性**：同一任期至多一个领导者；

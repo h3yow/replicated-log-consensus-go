@@ -8,7 +8,7 @@ import (
 // Config 是节点的可调参数。所有时间以逻辑 tick 为单位。
 type Config struct {
 	ID                NodeID
-	Peers             []NodeID // 初始引导成员（含自身）；仅在空存储首次启动时生效，此后成员由日志中的变更条目决定
+	Peers             []NodeID // 初始引导成员（含自身）；在空存储首次启动、或持久化状态不含任何成员信息（旧版本升级）时生效，此后成员由日志中的变更条目决定
 	ElectionTimeout   int      // 选举超时基准（tick 数）
 	HeartbeatTick     int      // 心跳间隔（tick 数）
 	MaxEntriesPerMsg  int      // 单条 AppendEntries 最大条目数
@@ -93,9 +93,13 @@ func NewNode(cfg Config, st Storage, rnd *rand.Rand) (*Node, error) {
 	n.log.snapshotData = ps.SnapData
 	n.log.snapshotVoters = append([]NodeID(nil), ps.SnapVoters...)
 	n.log.snapshotLearners = append([]NodeID(nil), ps.SnapLearners...)
-	if ps.isEmpty() {
-		// 首次引导：以 Config.Peers 为初始投票成员（可能为空，
+	if ps.hasNoMembershipInfo() {
+		// 首次引导，或从上一版本升级（旧版本的持久化状态不含任何成员
+		// 元数据：无快照成员、日志中也没有成员变更条目，成员是静态的
+		// Config.Peers）：以 Config.Peers 为初始投票成员基底（可能为空，
 		// 空配置表示该节点等待以学习者身份被加入集群）。
+		// 只要持久化状态里存在任何成员信息，就一律以持久化状态为准，
+		// 确保被动态摘除的节点重启后不会被误判回成员。
 		n.log.snapshotVoters = append([]NodeID(nil), cfg.Peers...)
 	}
 	// 重启后：恢复持久化的提交点（至少覆盖快照点），
